@@ -13,6 +13,9 @@
 (define-constant err-invalid-amount (err u106))
 (define-constant err-insufficient-balance (err u107))
 (define-constant err-oracle-only (err u108))
+(define-constant err-not-listed (err u109))
+(define-constant err-invalid-price (err u110))
+(define-constant err-cannot-buy-own (err u111))
 
 (define-data-var quota-counter uint u0)
 (define-data-var treasury-balance uint u0)
@@ -60,7 +63,18 @@
     reporter: principal
   })
 
+(define-map quota-listings
+  uint
+  {
+    quota-id: uint,
+    seller: principal,
+    price: uint,
+    active: bool
+  })
+
 (define-data-var report-counter uint u0)
+(define-data-var marketplace-commission uint u5)
+(define-data-var listing-counter uint u0)
 
 (define-public (register-fisher)
   (let
@@ -250,3 +264,82 @@
     reporting-reward: (var-get reporting-reward),
     penalty-amount: (var-get penalty-amount)
   })
+
+(define-public (list-quota-for-sale (quota-id uint) (price uint))
+  (let
+    ((quota-data (unwrap! (map-get? quotas quota-id) err-not-found))
+     (fisher-data (unwrap! (map-get? fishers tx-sender) err-not-found))
+     (listing-id (+ (var-get listing-counter) u1)))
+    (asserts! (get registered fisher-data) err-not-authorized)
+    (asserts! (get active fisher-data) err-frozen)
+    (asserts! (not (get frozen quota-data)) err-frozen)
+    (asserts! (is-eq (get fisher quota-data) tx-sender) err-not-authorized)
+    (asserts! (> price u0) err-invalid-price)
+    (map-set quota-listings listing-id
+      {
+        quota-id: quota-id,
+        seller: tx-sender,
+        price: price,
+        active: true
+      })
+    (var-set listing-counter listing-id)
+    (ok listing-id)))
+
+(define-public (buy-quota-from-marketplace (listing-id uint))
+  (let
+    ((listing-data (unwrap! (map-get? quota-listings listing-id) err-not-listed))
+     (quota-data (unwrap! (map-get? quotas (get quota-id listing-data)) err-not-found))
+     (buyer-data (unwrap! (map-get? fishers tx-sender) err-not-found))
+     (seller-data (unwrap! (map-get? fishers (get seller listing-data)) err-not-found))
+     (price (get price listing-data))
+     (commission (/ (* price (var-get marketplace-commission)) u100))
+     (seller-payout (- price commission))
+     (target-quota-id (get quota-id listing-data)))
+    (asserts! (get active listing-data) err-not-listed)
+    (asserts! (get registered buyer-data) err-not-authorized)
+    (asserts! (get active buyer-data) err-frozen)
+    (asserts! (not (is-eq tx-sender (get seller listing-data))) err-cannot-buy-own)
+    (asserts! (>= (ft-get-balance fisheries-token tx-sender) price) err-insufficient-balance)
+    (try! (ft-transfer? fisheries-token seller-payout tx-sender (get seller listing-data)))
+    (try! (ft-transfer? fisheries-token commission tx-sender contract-owner))
+    (try! (nft-transfer? fishing-quota target-quota-id (get seller listing-data) tx-sender))
+    (map-set quotas target-quota-id
+      (merge quota-data { fisher: tx-sender }))
+    (var-set filter-quota-id target-quota-id)
+    (let
+      ((seller-quotas (default-to (list) (map-get? fisher-quotas (get seller listing-data))))
+       (buyer-quotas (default-to (list) (map-get? fisher-quotas tx-sender)))
+       (filtered-seller-quotas (filter is-not-target-quota seller-quotas)))
+      (map-set fisher-quotas (get seller listing-data) filtered-seller-quotas)
+      (map-set fisher-quotas tx-sender (unwrap! (as-max-len? (append buyer-quotas target-quota-id) u10) err-invalid-amount)))
+    (map-set quota-listings listing-id
+      (merge listing-data { active: false }))
+    (var-set treasury-balance (+ (var-get treasury-balance) commission))
+    (ok true)))
+
+(define-public (cancel-quota-listing (listing-id uint))
+  (let
+    ((listing-data (unwrap! (map-get? quota-listings listing-id) err-not-listed)))
+    (asserts! (get active listing-data) err-not-listed)
+    (asserts! (is-eq tx-sender (get seller listing-data)) err-not-authorized)
+    (map-set quota-listings listing-id
+      (merge listing-data { active: false }))
+    (ok true)))
+
+(define-public (update-marketplace-commission (new-commission uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-commission u20) err-invalid-amount)
+    (var-set marketplace-commission new-commission)
+    (ok true)))
+
+(define-read-only (get-quota-listing (listing-id uint))
+  (map-get? quota-listings listing-id))
+
+(define-read-only (get-marketplace-commission)
+  (var-get marketplace-commission))
+
+(define-data-var filter-quota-id uint u0)
+
+(define-private (is-not-target-quota (id uint))
+  (not (is-eq id (var-get filter-quota-id))))
