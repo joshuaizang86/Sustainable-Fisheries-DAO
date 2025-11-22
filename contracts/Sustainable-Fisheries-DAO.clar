@@ -16,6 +16,9 @@
 (define-constant err-not-listed (err u109))
 (define-constant err-invalid-price (err u110))
 (define-constant err-cannot-buy-own (err u111))
+(define-constant err-not-staked (err u112))
+(define-constant err-insufficient-stake (err u113))
+(define-constant err-cannot-delegate-self (err u114))
 
 (define-data-var quota-counter uint u0)
 (define-data-var treasury-balance uint u0)
@@ -72,9 +75,21 @@
     active: bool
   })
 
+(define-map stakes
+  principal
+  {
+    staked-amount: uint,
+    delegated-to: (optional principal)
+  })
+
+(define-map delegation-received
+  principal
+  uint)
+
 (define-data-var report-counter uint u0)
 (define-data-var marketplace-commission uint u5)
 (define-data-var listing-counter uint u0)
+(define-data-var total-staked uint u0)
 
 (define-public (register-fisher)
   (let
@@ -343,3 +358,93 @@
 
 (define-private (is-not-target-quota (id uint))
   (not (is-eq id (var-get filter-quota-id))))
+
+(define-public (stake-tokens (amount uint))
+  (let
+    ((fisher-data (unwrap! (map-get? fishers tx-sender) err-not-found))
+     (current-stake (default-to { staked-amount: u0, delegated-to: none } (map-get? stakes tx-sender))))
+    (asserts! (get registered fisher-data) err-not-authorized)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= (ft-get-balance fisheries-token tx-sender) amount) err-insufficient-balance)
+    (try! (ft-burn? fisheries-token amount tx-sender))
+    (map-set stakes tx-sender
+      {
+        staked-amount: (+ (get staked-amount current-stake) amount),
+        delegated-to: (get delegated-to current-stake)
+      })
+    (var-set total-staked (+ (var-get total-staked) amount))
+    (ok true)))
+
+(define-public (unstake-tokens (amount uint))
+  (let
+    ((current-stake (unwrap! (map-get? stakes tx-sender) err-not-staked))
+     (staked-amt (get staked-amount current-stake)))
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= staked-amt amount) err-insufficient-stake)
+    (if (is-some (get delegated-to current-stake))
+      (let
+        ((delegate (unwrap-panic (get delegated-to current-stake)))
+         (current-delegation (default-to u0 (map-get? delegation-received delegate))))
+        (map-set delegation-received delegate (if (>= current-delegation amount) (- current-delegation amount) u0)))
+      true)
+    (try! (ft-mint? fisheries-token amount tx-sender))
+    (map-set stakes tx-sender
+      {
+        staked-amount: (- staked-amt amount),
+        delegated-to: (get delegated-to current-stake)
+      })
+    (var-set total-staked (- (var-get total-staked) amount))
+    (ok true)))
+
+(define-public (delegate-stake (delegate principal))
+  (let
+    ((current-stake (unwrap! (map-get? stakes tx-sender) err-not-staked))
+     (delegate-data (unwrap! (map-get? fishers delegate) err-not-found))
+     (staked-amt (get staked-amount current-stake)))
+    (asserts! (> staked-amt u0) err-insufficient-stake)
+    (asserts! (get registered delegate-data) err-not-found)
+    (asserts! (get active delegate-data) err-frozen)
+    (asserts! (not (is-eq tx-sender delegate)) err-cannot-delegate-self)
+    (if (is-some (get delegated-to current-stake))
+      (let
+        ((old-delegate (unwrap-panic (get delegated-to current-stake)))
+         (old-delegation (default-to u0 (map-get? delegation-received old-delegate))))
+        (map-set delegation-received old-delegate (if (>= old-delegation staked-amt) (- old-delegation staked-amt) u0)))
+      true)
+    (map-set stakes tx-sender
+      {
+        staked-amount: staked-amt,
+        delegated-to: (some delegate)
+      })
+    (let
+      ((current-delegation (default-to u0 (map-get? delegation-received delegate))))
+      (map-set delegation-received delegate (+ current-delegation staked-amt)))
+    (ok true)))
+
+(define-public (undelegate-stake)
+  (let
+    ((current-stake (unwrap! (map-get? stakes tx-sender) err-not-staked))
+     (staked-amt (get staked-amount current-stake)))
+    (asserts! (is-some (get delegated-to current-stake)) err-not-found)
+    (let
+      ((delegate (unwrap-panic (get delegated-to current-stake)))
+       (current-delegation (default-to u0 (map-get? delegation-received delegate))))
+      (map-set delegation-received delegate (if (>= current-delegation staked-amt) (- current-delegation staked-amt) u0)))
+    (map-set stakes tx-sender
+      {
+        staked-amount: staked-amt,
+        delegated-to: none
+      })
+    (ok true)))
+
+(define-read-only (get-stake-info (staker principal))
+  (map-get? stakes staker))
+
+(define-read-only (get-voting-power (address principal))
+  (let
+    ((own-stake (default-to { staked-amount: u0, delegated-to: none } (map-get? stakes address)))
+     (delegated (default-to u0 (map-get? delegation-received address))))
+    (ok (+ (get staked-amount own-stake) delegated))))
+
+(define-read-only (get-total-staked)
+  (var-get total-staked))
